@@ -23,7 +23,6 @@ export const coordinationConfigObj = registerAs('coordination', () => {
         }
       : undefined,
   };
-  console.log(config);
 
   coordinationConfigSchema.parse(config);
 
