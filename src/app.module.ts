@@ -1,10 +1,24 @@
 import { Module } from '@nestjs/common';
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
+import { ConfigModule } from '@nestjs/config';
+import { CoordinationConfig, coordinationConfigObj } from './config';
+import { CoordinationModule } from './coordination/coordination.module';
 
 @Module({
-  imports: [],
-  controllers: [AppController],
-  providers: [AppService],
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+      load: [coordinationConfigObj],
+    }),
+    CoordinationModule.registerAsync({
+      isGlobal: true,
+      useFactory: ({ etcdHosts, etcdAuth }: CoordinationConfig) => ({
+        etcdHosts: etcdHosts,
+        etcdAuth: etcdAuth,
+      }),
+      inject: [coordinationConfigObj.KEY],
+    }),
+  ],
+  controllers: [],
+  providers: [],
 })
 export class AppModule {}
