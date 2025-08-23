@@ -1,10 +1,11 @@
 import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import {} from '../coordination.module';
+import { Election, Etcd3 } from 'etcd3';
+import { hostname } from 'os';
 import {
   CoordinationModuleConfig,
   CoordinationModuleConfigToken,
-} from '../coordination.module';
-import { Election, Etcd3 } from 'etcd3';
-import { hostname } from 'os';
+} from '../coordination.module-definition';
 
 @Injectable()
 export class DistributionService implements OnModuleInit {
@@ -14,7 +15,11 @@ export class DistributionService implements OnModuleInit {
 
   private election: Election;
 
-  private readonly leaderLeaseTTLSeconds = 5;
+  private readonly LEADER_LEASE_SECONDS = 5;
+
+  private readonly CAMPAIGN_BACKOFF_MS = 3000;
+
+  private readonly LEADER_OBSERVER_BACKOFF_MS = 3000;
 
   constructor(
     @Inject(CoordinationModuleConfigToken)
@@ -29,10 +34,11 @@ export class DistributionService implements OnModuleInit {
     );
     this.election = this.etcdClient.election(
       this.moduleConfig.taskName,
-      this.leaderLeaseTTLSeconds,
+      this.LEADER_LEASE_SECONDS,
     );
 
     this.runCampaign();
+    this.observeLeader();
   }
 
   private runCampaign() {
@@ -42,6 +48,24 @@ export class DistributionService implements OnModuleInit {
 
     campaign.on('error', (err) => {
       this.logger.error('Election error', err);
+      setTimeout(this.runCampaign.bind(this), this.CAMPAIGN_BACKOFF_MS);
+    });
+  }
+
+  private async observeLeader() {
+    const observer = await this.election.observe();
+    this.logger.log(`Current leader is ${observer.leader()}`);
+
+    observer.on('change', (leader) => {
+      this.logger.log(`New leader elected: ${leader}`);
+    });
+
+    observer.on('error', (err) => {
+      this.logger.error('Leader observation error', err);
+      setTimeout(
+        this.observeLeader.bind(this),
+        this.LEADER_OBSERVER_BACKOFF_MS,
+      );
     });
   }
 }

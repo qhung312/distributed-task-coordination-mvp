@@ -1,9 +1,10 @@
 import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import {} from '../coordination.module';
+import { hostname } from 'os';
 import {
   CoordinationModuleConfig,
   CoordinationModuleConfigToken,
-} from '../coordination.module';
-import { hostname } from 'os';
+} from '../coordination.module-definition';
 
 @Injectable()
 export class TaskService implements OnModuleInit {
