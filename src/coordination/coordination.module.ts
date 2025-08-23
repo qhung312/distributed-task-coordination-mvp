@@ -1,23 +1,11 @@
-import { ConfigurableModuleBuilder, Module } from '@nestjs/common';
+import { Module } from '@nestjs/common';
 import { Etcd3 } from 'etcd3';
-
-export type CoordinationModuleConfig = {
-  etcdHosts: string[];
-  etcdAuth?: {
-    username: string;
-    password: string;
-  };
-};
-
-const { ConfigurableModuleClass, MODULE_OPTIONS_TOKEN } =
-  new ConfigurableModuleBuilder<CoordinationModuleConfig>()
-    .setExtras({ isGlobal: false }, (definition, extras) => ({
-      ...definition,
-      isGlobal: extras.isGlobal,
-    }))
-    .build();
-
-export { MODULE_OPTIONS_TOKEN as CoordinationModuleConfigToken };
+import { DistributionService, TaskService } from './services';
+import {
+  CoordinationConfigurableModuleClass,
+  CoordinationModuleConfig,
+  CoordinationModuleConfigToken,
+} from './coordination.module-definition';
 
 @Module({
   imports: [],
@@ -29,8 +17,10 @@ export { MODULE_OPTIONS_TOKEN as CoordinationModuleConfigToken };
           hosts: options.etcdHosts,
           auth: options.etcdAuth,
         }),
-      inject: [MODULE_OPTIONS_TOKEN],
+      inject: [CoordinationModuleConfigToken],
     },
+    DistributionService,
+    TaskService,
   ],
 })
-export class CoordinationModule extends ConfigurableModuleClass {}
+export class CoordinationModule extends CoordinationConfigurableModuleClass {}
