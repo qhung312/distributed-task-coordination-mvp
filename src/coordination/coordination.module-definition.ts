@@ -1,4 +1,5 @@
 import { ConfigurableModuleBuilder } from '@nestjs/common';
+import { TaskDistributionStrategy } from './lib';
 
 export interface CoordinationModuleConfig {
   etcdHosts: string[];
@@ -7,6 +8,7 @@ export interface CoordinationModuleConfig {
     password: string;
   };
   taskName: string;
+  distributionStrategy: TaskDistributionStrategy;
 }
 
 export const {

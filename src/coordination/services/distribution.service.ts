@@ -21,6 +21,9 @@ export class DistributionService implements OnModuleInit {
 
   private readonly LEADER_OBSERVER_BACKOFF_MS = 3000;
 
+  private isLeader = false;
+  private electionKeyRevision?: string;
+
   constructor(
     @Inject(CoordinationModuleConfigToken)
     private moduleConfig: CoordinationModuleConfig,
@@ -44,10 +47,21 @@ export class DistributionService implements OnModuleInit {
   private runCampaign() {
     const campaign = this.election.campaign(this.clientId);
 
-    campaign.on('elected', () => {});
+    campaign.on('elected', () => {
+      this.isLeader = true;
+      // Key revision should be public IMO, but for some reason the Node SDK
+      // doesn't expose it. This is needed to ensure that we still have
+      // leadership when performing any writes later
+      // Reference: https://github.com/etcd-io/etcd/blob/929e947cad4f1f9b7bb781fa75a1066ef4c0846f/server/etcdserver/api/v3election/v3electionpb/v3election.proto#L81-L83
+      this.electionKeyRevision = (campaign as any).keyRevision;
+    });
 
     campaign.on('error', (err) => {
       this.logger.error('Election error', err);
+
+      this.isLeader = false;
+      this.electionKeyRevision = undefined;
+
       setTimeout(this.runCampaign.bind(this), this.CAMPAIGN_BACKOFF_MS);
     });
   }
