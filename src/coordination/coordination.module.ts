@@ -1,5 +1,6 @@
 import { ConfigurableModuleBuilder, Module } from '@nestjs/common';
 import { Etcd3 } from 'etcd3';
+import { DistributionService, TaskService } from './services';
 
 export type CoordinationModuleConfig = {
   etcdHosts: string[];
@@ -7,6 +8,7 @@ export type CoordinationModuleConfig = {
     username: string;
     password: string;
   };
+  taskName: string;
 };
 
 const { ConfigurableModuleClass, MODULE_OPTIONS_TOKEN } =
@@ -31,6 +33,8 @@ export { MODULE_OPTIONS_TOKEN as CoordinationModuleConfigToken };
         }),
       inject: [MODULE_OPTIONS_TOKEN],
     },
+    DistributionService,
+    TaskService,
   ],
 })
 export class CoordinationModule extends ConfigurableModuleClass {}

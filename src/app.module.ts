@@ -14,6 +14,7 @@ import { CoordinationModule } from './coordination/coordination.module';
       useFactory: ({ etcdHosts, etcdAuth }: CoordinationConfig) => ({
         etcdHosts: etcdHosts,
         etcdAuth: etcdAuth,
+        taskName: 'demoTask',
       }),
       inject: [coordinationConfigObj.KEY],
     }),
