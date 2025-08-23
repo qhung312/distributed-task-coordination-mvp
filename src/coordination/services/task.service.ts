@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import {} from '../coordination.module';
 import { hostname } from 'os';
 import {
@@ -7,20 +7,17 @@ import {
 } from '../coordination.module-definition';
 
 @Injectable()
-export class TaskService implements OnModuleInit {
-  private logger: Logger;
+export class TaskService {
+  public static readonly prefix = 'task';
 
-  private clientId: string;
+  private readonly clientId = hostname();
+
+  private readonly logger = new Logger(
+    `${TaskService.name} - ${this.moduleConfig.taskName} - ${this.clientId}`,
+  );
 
   constructor(
     @Inject(CoordinationModuleConfigToken)
     private moduleConfig: CoordinationModuleConfig,
   ) {}
-
-  onModuleInit() {
-    this.clientId = hostname();
-    this.logger = new Logger(
-      `${TaskService.name} - ${this.moduleConfig.taskName} - ${this.clientId}`,
-    );
-  }
 }

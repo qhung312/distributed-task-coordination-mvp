@@ -6,16 +6,22 @@ import {
   CoordinationModuleConfig,
   CoordinationModuleConfigToken,
 } from '../coordination.module-definition';
+import { TaskService } from './task.service';
 
 @Injectable()
 export class DistributionService implements OnModuleInit {
-  private logger: Logger;
+  private readonly clientId = hostname();
 
-  private clientId: string;
-
-  private election: Election;
+  private logger = new Logger(
+    `${DistributionService.name} - ${this.moduleConfig.taskName} - ${this.clientId}`,
+  );
 
   private readonly LEADER_LEASE_SECONDS = 5;
+
+  private election: Election = this.etcdClient.election(
+    this.moduleConfig.taskName,
+    this.LEADER_LEASE_SECONDS,
+  );
 
   private readonly CAMPAIGN_BACKOFF_MS = 3000;
 
@@ -24,6 +30,15 @@ export class DistributionService implements OnModuleInit {
   private isLeader = false;
   private electionKeyRevision?: string;
 
+  /**
+   * Prefix that the SDK uses to perform leader election. We piggyback on this
+   * for cluster membership notifications
+   * Reference: https://github.com/microsoft/etcd3/blob/master/src/election.ts#L409-L421
+   */
+  private readonly MEMBERSHIP_PREFIX = `${Election.prefix}/${this.moduleConfig.taskName}/`;
+
+  private readonly TASK_PREFIX = `${TaskService.prefix}/${this.moduleConfig.taskName}/`;
+
   constructor(
     @Inject(CoordinationModuleConfigToken)
     private moduleConfig: CoordinationModuleConfig,
@@ -31,15 +46,6 @@ export class DistributionService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    this.clientId = hostname();
-    this.logger = new Logger(
-      `${DistributionService.name} - ${this.moduleConfig.taskName} - ${this.clientId}`,
-    );
-    this.election = this.etcdClient.election(
-      this.moduleConfig.taskName,
-      this.LEADER_LEASE_SECONDS,
-    );
-
     this.runCampaign();
     this.observeLeader();
   }
@@ -52,7 +58,7 @@ export class DistributionService implements OnModuleInit {
       // Key revision should be public IMO, but for some reason the Node SDK
       // doesn't expose it. This is needed to ensure that we still have
       // leadership when performing any writes later
-      // Reference: https://github.com/etcd-io/etcd/blob/929e947cad4f1f9b7bb781fa75a1066ef4c0846f/server/etcdserver/api/v3election/v3electionpb/v3election.proto#L81-L83
+      // Reference: https://github.com/etcd-io/etcd/blob/main/server/etcdserver/api/v3election/v3electionpb/v3election.proto#L84-L87
       this.electionKeyRevision = (campaign as any).keyRevision;
     });
 
