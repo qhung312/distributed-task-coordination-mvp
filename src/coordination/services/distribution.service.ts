@@ -1,6 +1,6 @@
 import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import {} from '../coordination.module';
-import { Election, Etcd3 } from 'etcd3';
+import { Election, Etcd3, IEvent, IOperation, IRequestOp } from 'etcd3';
 import { hostname } from 'os';
 import {
   CoordinationModuleConfig,
@@ -9,10 +9,13 @@ import {
 import { TaskService } from './task.service';
 import { BigNumber } from 'bignumber.js';
 import { difference } from 'lodash';
+import { TaskDistributionResult } from '../lib';
+import { debounceTime, Subject } from 'rxjs';
 
 type ClusterInformation = {
   clientIds: string[];
   taskIds: string[];
+  clientAssignments: TaskDistributionResult;
   revision: string;
 };
 
@@ -38,7 +41,7 @@ export class DistributionService implements OnModuleInit {
 
   private readonly CAMPAIGN_BACKOFF_MS = 3000;
 
-  private readonly LEADER_OBSERVER_BACKOFF_MS = 3000;
+  private readonly REDISTRIBUTION_DEBOUNCE_MS = 3000;
 
   /**
    * Prefix that the SDK uses to perform leader election. We piggyback on this
@@ -51,6 +54,10 @@ export class DistributionService implements OnModuleInit {
 
   private get taskPrefix() {
     return this.taskService.taskPrefix;
+  }
+
+  private get assignmentPrefix() {
+    return `assignment/${this.moduleConfig.taskName}/`;
   }
 
   constructor(
@@ -73,8 +80,11 @@ export class DistributionService implements OnModuleInit {
       // doesn't expose it. This is needed to ensure that we still have
       // leadership when performing any writes later
       // Reference: https://github.com/etcd-io/etcd/blob/main/server/etcdserver/api/v3election/v3electionpb/v3election.proto#L84-L87
-      const electionKeyRevision = (campaign as any).keyRevision;
-      await this.coordinateCluster(electionKeyRevision);
+      const keyRevision = (campaign as any).keyRevision;
+      const electionKey = await campaign.getCampaignKey();
+
+      await this.coordinateCluster(electionKey, keyRevision);
+      await campaign.resign();
     });
 
     campaign.on('error', (err) => {
@@ -86,16 +96,13 @@ export class DistributionService implements OnModuleInit {
 
   /**
    * Acts as cluster leader to distribute tasks.
-   * Resolves when no longer holding leadership
+   * Settles when no longer holding leadership
    */
-  private async coordinateCluster(leaderKeyRevision: string) {
-    const {
-      clientIds,
-      taskIds,
-      revision: snapshotRevision,
-    } = await this.getClusterInformation();
+  private async coordinateCluster(electionKey: string, keyRevision: string) {
+    const initialClusterInfo = await this.getClusterInformation();
+    let { clientIds, taskIds, clientAssignments } = initialClusterInfo;
 
-    const startWatchRevision = new BigNumber(snapshotRevision)
+    const startWatchRevision = new BigNumber(initialClusterInfo.revision)
       .plus(1)
       .toString();
     const memberWatcher = await this.etcdClient
@@ -108,6 +115,121 @@ export class DistributionService implements OnModuleInit {
       .startRevision(startWatchRevision)
       .prefix(this.taskPrefix)
       .create();
+
+    return new Promise((resolve) => {
+      const writeNewDistribution = new Subject();
+
+      writeNewDistribution
+        .pipe(debounceTime(this.REDISTRIBUTION_DEBOUNCE_MS))
+        .subscribe(async (update: (IRequestOp | IOperation)[]) => {
+          if (update.length === 0) {
+            return;
+          }
+
+          try {
+            const result = await this.etcdClient
+              .if(electionKey, 'Create', '==', keyRevision)
+              .then(...update)
+              .commit();
+
+            if (!result.succeeded) {
+              // Split-brain detected, so just stop
+              throw new Error('Split-brain detected');
+            }
+          } catch (err) {
+            this.logger.error(err);
+
+            // Cleanup resources and resign
+            await memberWatcher.cancel();
+            await taskWatcher.cancel();
+
+            resolve(undefined);
+          }
+        });
+
+      memberWatcher.on('data', (data) => {
+        clientIds = this.processMembershipChanges(data.events, clientIds);
+        const newDistribution = this.moduleConfig.distributionStrategy(
+          taskIds,
+          clientIds,
+        );
+        const updatePlan = this.buildIncrementalDistributionUpdatePlan(
+          clientAssignments,
+          newDistribution,
+        );
+        clientAssignments = newDistribution;
+        writeNewDistribution.next(updatePlan);
+      });
+
+      taskWatcher.on('data', (data) => {
+        taskIds = this.processMembershipChanges(data.events, taskIds);
+        const newDistribution = this.moduleConfig.distributionStrategy(
+          taskIds,
+          clientIds,
+        );
+        const updatePlan = this.buildIncrementalDistributionUpdatePlan(
+          clientAssignments,
+          newDistribution,
+        );
+        clientAssignments = newDistribution;
+        writeNewDistribution.next(updatePlan);
+      });
+    });
+  }
+
+  private processMembershipChanges(
+    events: IEvent[],
+    currentCluster: string[],
+  ): string[] {
+    const newCluster = [...currentCluster];
+
+    for (const event of events) {
+      const member = event.kv.value.toString();
+
+      if (event.type === 'Put') {
+        if (!newCluster.includes(member)) {
+          newCluster.push(member);
+        }
+      } else {
+        const idx = newCluster.indexOf(member);
+        if (idx > -1) {
+          newCluster.splice(idx, 1);
+        }
+      }
+    }
+
+    return newCluster;
+  }
+
+  /**
+   * Build operation to incrementally update task distribution in order to get
+   * from `cur` to `target`
+   */
+  private buildIncrementalDistributionUpdatePlan(
+    cur: TaskDistributionResult,
+    target: TaskDistributionResult,
+  ): (IRequestOp | IOperation)[] {
+    const ops: (IRequestOp | IOperation)[] = [];
+
+    // deleted keys
+    for (const clientId of Object.keys(cur)) {
+      if (!target[clientId]) {
+        ops.push(
+          this.etcdClient.delete().key(`${this.assignmentPrefix}${clientId}`),
+        );
+      }
+    }
+
+    // upserted keys
+    for (const [clientId, taskIds] of Object.entries(target)) {
+      ops.push(
+        this.etcdClient
+          .put(`${this.assignmentPrefix}${clientId}`)
+          .value(JSON.stringify(taskIds)),
+      );
+    }
+
+    return ops;
   }
 
   private async observeTasksAssignedToSelf() {
@@ -118,7 +240,7 @@ export class DistributionService implements OnModuleInit {
 
     const watcher = await this.etcdClient
       .watch()
-      .key(`${this.taskPrefix}${this.clientId}`)
+      .key(`${this.assignmentPrefix}${this.clientId}`)
       .startRevision(
         new BigNumber(initialTaskAssignment.revision).plus(1).toString(),
       )
@@ -143,12 +265,12 @@ export class DistributionService implements OnModuleInit {
     clientId: string,
   ): Promise<TaskAssignment> {
     const taskResult = await this.etcdClient
-      .get(`${this.taskPrefix}${clientId}`)
+      .get(`${this.assignmentPrefix}${clientId}`)
       .exec();
     const taskIds: string[] = JSON.parse(
       taskResult.kvs[0]?.value.toString() || '[]',
     );
-    return { clientId, taskIds, revision: taskResult.header.revision };
+    return { taskIds, revision: taskResult.header.revision };
   }
 
   /**
@@ -173,6 +295,18 @@ export class DistributionService implements OnModuleInit {
       return key.replace(this.taskPrefix, '');
     });
 
-    return { clientIds, taskIds, revision };
+    const assignmentResults = await this.etcdClient
+      .getAll()
+      .prefix(this.assignmentPrefix)
+      .revision(revision)
+      .exec();
+    const clientAssignments = assignmentResults.kvs.reduce((acc, kv) => {
+      const key = kv.key.toString().replace(this.assignmentPrefix, '');
+      const value = JSON.parse(kv.value.toString());
+      acc[key] = value;
+      return acc;
+    }, {});
+
+    return { clientIds, taskIds, clientAssignments, revision };
   }
 }
