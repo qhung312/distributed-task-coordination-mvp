@@ -7,9 +7,16 @@ import {
   CoordinationModuleConfigToken,
 } from '../coordination.module-definition';
 import { TaskService } from './task.service';
+import { BigNumber } from 'bignumber.js';
+import { difference } from 'lodash';
 
 type ClusterInformation = {
   clientIds: string[];
+  taskIds: string[];
+  revision: string;
+};
+
+type TaskAssignment = {
   taskIds: string[];
   revision: string;
 };
@@ -33,9 +40,6 @@ export class DistributionService implements OnModuleInit {
 
   private readonly LEADER_OBSERVER_BACKOFF_MS = 3000;
 
-  private isLeader = false;
-  private electionKeyRevision?: string;
-
   /**
    * Prefix that the SDK uses to perform leader election. We piggyback on this
    * for cluster membership notifications
@@ -58,29 +62,93 @@ export class DistributionService implements OnModuleInit {
 
   async onModuleInit() {
     this.runCampaign();
-    this.observeLeader();
+    this.observeTasksAssignedToSelf();
   }
 
   private runCampaign() {
     const campaign = this.election.campaign(this.clientId);
 
-    campaign.on('elected', () => {
-      this.isLeader = true;
+    campaign.on('elected', async () => {
       // Key revision should be public IMO, but for some reason the Node SDK
       // doesn't expose it. This is needed to ensure that we still have
       // leadership when performing any writes later
       // Reference: https://github.com/etcd-io/etcd/blob/main/server/etcdserver/api/v3election/v3electionpb/v3election.proto#L84-L87
-      this.electionKeyRevision = (campaign as any).keyRevision;
+      const electionKeyRevision = (campaign as any).keyRevision;
+      await this.coordinateCluster(electionKeyRevision);
     });
 
     campaign.on('error', (err) => {
       this.logger.error('Election error', err);
 
-      this.isLeader = false;
-      this.electionKeyRevision = undefined;
-
       setTimeout(this.runCampaign.bind(this), this.CAMPAIGN_BACKOFF_MS);
     });
+  }
+
+  /**
+   * Acts as cluster leader to distribute tasks.
+   * Resolves when no longer holding leadership
+   */
+  private async coordinateCluster(leaderKeyRevision: string) {
+    const {
+      clientIds,
+      taskIds,
+      revision: snapshotRevision,
+    } = await this.getClusterInformation();
+
+    const startWatchRevision = new BigNumber(snapshotRevision)
+      .plus(1)
+      .toString();
+    const memberWatcher = await this.etcdClient
+      .watch()
+      .startRevision(startWatchRevision)
+      .prefix(this.membershipPrefix)
+      .create();
+    const taskWatcher = await this.etcdClient
+      .watch()
+      .startRevision(startWatchRevision)
+      .prefix(this.taskPrefix)
+      .create();
+  }
+
+  private async observeTasksAssignedToSelf() {
+    const initialTaskAssignment = await this.getTasksAssignedToClientId(
+      this.clientId,
+    );
+    let { taskIds } = initialTaskAssignment;
+
+    const watcher = await this.etcdClient
+      .watch()
+      .key(`${this.taskPrefix}${this.clientId}`)
+      .startRevision(
+        new BigNumber(initialTaskAssignment.revision).plus(1).toString(),
+      )
+      .create();
+
+    watcher.on('data', async (data) => {
+      let newTaskIds: string[] = [];
+      for (const event of data.events) {
+        newTaskIds =
+          event.type === 'Put' ? JSON.parse(event.kv.value.toString()) : [];
+      }
+
+      const added = difference(newTaskIds, taskIds);
+      const removed = difference(taskIds, newTaskIds);
+      this.logger.log(`Added tasks: ${added}. Removed tasks: ${removed}`);
+
+      taskIds = newTaskIds;
+    });
+  }
+
+  private async getTasksAssignedToClientId(
+    clientId: string,
+  ): Promise<TaskAssignment> {
+    const taskResult = await this.etcdClient
+      .get(`${this.taskPrefix}${clientId}`)
+      .exec();
+    const taskIds: string[] = JSON.parse(
+      taskResult.kvs[0]?.value.toString() || '[]',
+    );
+    return { clientId, taskIds, revision: taskResult.header.revision };
   }
 
   /**
@@ -106,22 +174,5 @@ export class DistributionService implements OnModuleInit {
     });
 
     return { clientIds, taskIds, revision };
-  }
-
-  private async observeLeader() {
-    const observer = await this.election.observe();
-    this.logger.log(`Leader is ${observer.leader()}`);
-
-    observer.on('change', (leader) =>
-      this.logger.log(`Leader changed to ${leader}`),
-    );
-
-    observer.on('error', (err) => {
-      this.logger.error('Leader observation error', err);
-      setTimeout(
-        this.observeLeader.bind(this),
-        this.LEADER_OBSERVER_BACKOFF_MS,
-      );
-    });
   }
 }
