@@ -35,14 +35,19 @@ export class DistributionService implements OnModuleInit {
    * for cluster membership notifications
    * Reference: https://github.com/microsoft/etcd3/blob/master/src/election.ts#L409-L421
    */
-  private readonly MEMBERSHIP_PREFIX = `${Election.prefix}/${this.moduleConfig.taskName}/`;
+  private get membershipPrefix() {
+    return `${Election.prefix}/${this.moduleConfig.taskName}/`;
+  }
 
-  private readonly TASK_PREFIX = `${TaskService.prefix}/${this.moduleConfig.taskName}/`;
+  private get taskPrefix() {
+    return this.taskService.taskPrefix;
+  }
 
   constructor(
     @Inject(CoordinationModuleConfigToken)
     private moduleConfig: CoordinationModuleConfig,
     private etcdClient: Etcd3,
+    private taskService: TaskService,
   ) {}
 
   async onModuleInit() {
