@@ -58,6 +58,7 @@ export class DistributionService implements OnModuleInit {
 
   async onModuleInit() {
     this.runCampaign();
+    this.observeLeader();
   }
 
   private runCampaign() {
@@ -105,5 +106,22 @@ export class DistributionService implements OnModuleInit {
     });
 
     return { clientIds, taskIds, revision };
+  }
+
+  private async observeLeader() {
+    const observer = await this.election.observe();
+    this.logger.log(`Leader is ${observer.leader()}`);
+
+    observer.on('change', (leader) =>
+      this.logger.log(`Leader changed to ${leader}`),
+    );
+
+    observer.on('error', (err) => {
+      this.logger.error('Leader observation error', err);
+      setTimeout(
+        this.observeLeader.bind(this),
+        this.LEADER_OBSERVER_BACKOFF_MS,
+      );
+    });
   }
 }
