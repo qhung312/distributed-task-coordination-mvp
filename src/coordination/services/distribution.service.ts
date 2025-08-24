@@ -8,6 +8,12 @@ import {
 } from '../coordination.module-definition';
 import { TaskService } from './task.service';
 
+type ClusterInformation = {
+  clientIds: string[];
+  taskIds: string[];
+  revision: string;
+};
+
 @Injectable()
 export class DistributionService implements OnModuleInit {
   private readonly clientId = hostname();
@@ -52,7 +58,6 @@ export class DistributionService implements OnModuleInit {
 
   async onModuleInit() {
     this.runCampaign();
-    this.observeLeader();
   }
 
   private runCampaign() {
@@ -77,20 +82,28 @@ export class DistributionService implements OnModuleInit {
     });
   }
 
-  private async observeLeader() {
-    const observer = await this.election.observe();
-    this.logger.log(`Current leader is ${observer.leader()}`);
+  /**
+   * Perform a consistent read of clients and tasks in the cluster
+   */
+  private async getClusterInformation(): Promise<ClusterInformation> {
+    const clientsResult = await this.etcdClient
+      .getAll()
+      .prefix(this.membershipPrefix)
+      .exec();
+    const clientIds = clientsResult.kvs.map((kv) => kv.value.toString());
 
-    observer.on('change', (leader) => {
-      this.logger.log(`New leader elected: ${leader}`);
+    const revision = clientsResult.header.revision;
+
+    const tasksResult = await this.etcdClient
+      .getAll()
+      .prefix(this.taskPrefix)
+      .revision(revision)
+      .exec();
+    const taskIds = tasksResult.kvs.map((kv) => {
+      const key = kv.key.toString();
+      return key.replace(this.taskPrefix, '');
     });
 
-    observer.on('error', (err) => {
-      this.logger.error('Leader observation error', err);
-      setTimeout(
-        this.observeLeader.bind(this),
-        this.LEADER_OBSERVER_BACKOFF_MS,
-      );
-    });
+    return { clientIds, taskIds, revision };
   }
 }
