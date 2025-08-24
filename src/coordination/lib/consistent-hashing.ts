@@ -13,18 +13,20 @@ export const consistentHashing: TaskDistributionStrategy = (
   clientIds: string[],
 ): TaskDistributionResult => {
   const ret: TaskDistributionResult = {};
-  clientIds.forEach((id) => (ret[id] = []));
 
-  const clientHashes = clientIds.map((id) => hash(id));
-  clientHashes.sort();
+  const clients = clientIds.map((id) => ({
+    originalId: id,
+    hash: hash(id),
+  }));
+  clients.forEach((c) => (ret[c.originalId] = []));
+  clients.sort((a, b) => (a.hash < b.hash ? -1 : 1));
 
   for (const task of taskIds) {
     const taskHash = hash(task);
-    const closestClient =
-      clientHashes.find((c) => c >= taskHash) ?? clientHashes[0];
+    const closestClient = clients.find((c) => c.hash >= taskHash) ?? clients[0];
 
     if (closestClient) {
-      ret[closestClient].push(task);
+      ret[closestClient.originalId].push(task);
     }
   }
 
