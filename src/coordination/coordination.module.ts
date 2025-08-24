@@ -6,9 +6,10 @@ import {
   CoordinationModuleConfig,
   CoordinationModuleConfigToken,
 } from './coordination.module-definition';
+import { DiscoveryModule } from '@nestjs/core';
 
 @Module({
-  imports: [],
+  imports: [DiscoveryModule],
   providers: [
     {
       provide: Etcd3,
@@ -22,5 +23,6 @@ import {
     DistributionService,
     TaskService,
   ],
+  exports: [TaskService],
 })
 export class CoordinationModule extends CoordinationConfigurableModuleClass {}

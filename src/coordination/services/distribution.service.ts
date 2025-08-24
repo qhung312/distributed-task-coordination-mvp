@@ -9,8 +9,14 @@ import {
 import { TaskService } from './task.service';
 import { BigNumber } from 'bignumber.js';
 import { difference } from 'lodash';
-import { TaskDistributionResult } from '../lib';
-import { debounceTime, Subject } from 'rxjs';
+import {
+  CoordinationClient,
+  CoordinationTaskName,
+  SplitBrainError,
+  TaskDistributionResult,
+} from '../lib';
+import { debounceTime, mergeMap, Subject } from 'rxjs';
+import { DiscoveryService, ModuleRef } from '@nestjs/core';
 
 type ClusterInformation = {
   clientIds: string[];
@@ -65,11 +71,30 @@ export class DistributionService implements OnModuleInit {
     private moduleConfig: CoordinationModuleConfig,
     private etcdClient: Etcd3,
     private taskService: TaskService,
+    private discoveryService: DiscoveryService,
+    private moduleRef: ModuleRef,
   ) {}
 
-  async onModuleInit() {
+  onModuleInit() {
     this.runCampaign();
-    this.observeTasksAssignedToSelf();
+
+    // Discover clients of this task and propagate updates to them
+    this.discoveryService
+      .getProviders()
+      .filter(
+        (item) =>
+          this.discoveryService.getMetadataByDecorator(
+            CoordinationTaskName,
+            item,
+          ) === this.moduleConfig.taskName,
+      )
+      .forEach((provider) => {
+        const instance = this.moduleRef.get<CoordinationClient>(
+          provider.token,
+          { strict: false },
+        );
+        this.observeTasksAssignedToSelf(instance);
+      });
   }
 
   private runCampaign() {
@@ -83,8 +108,13 @@ export class DistributionService implements OnModuleInit {
       const keyRevision = (campaign as any).keyRevision;
       const electionKey = await campaign.getCampaignKey();
 
-      await this.coordinateCluster(electionKey, keyRevision);
-      await campaign.resign();
+      this.logger.log(`Elected as leader with key ${electionKey}`);
+
+      try {
+        await this.coordinateCluster(electionKey, keyRevision);
+      } finally {
+        await campaign.resign();
+      }
     });
 
     campaign.on('error', (err) => {
@@ -116,39 +146,55 @@ export class DistributionService implements OnModuleInit {
       .prefix(this.taskPrefix)
       .create();
 
+    // Rebalancing updates can fail, so the next leader can get stuck at a
+    // suboptimal distribution if there are no membership changes. We touch the
+    // current leader key to make sure we always make progress
+    await this.etcdClient.put(electionKey).touch();
+
     return new Promise((resolve) => {
       const writeNewDistribution = new Subject();
 
+      // We're performing incremental updates, which means that updates have
+      // to be sent and received in order, hence concurrency of 1
       writeNewDistribution
-        .pipe(debounceTime(this.REDISTRIBUTION_DEBOUNCE_MS))
-        .subscribe(async (update: (IRequestOp | IOperation)[]) => {
-          if (update.length === 0) {
-            return;
-          }
-
-          try {
-            const result = await this.etcdClient
-              .if(electionKey, 'Create', '==', keyRevision)
-              .then(...update)
-              .commit();
-
-            if (!result.succeeded) {
-              // Split-brain detected, so just stop
-              throw new Error('Split-brain detected');
+        .pipe(
+          debounceTime(this.REDISTRIBUTION_DEBOUNCE_MS),
+          mergeMap(async (update: (IRequestOp | IOperation)[]) => {
+            if (update.length === 0) {
+              return;
             }
-          } catch (err) {
-            this.logger.error(err);
 
-            // Cleanup resources and resign
-            await memberWatcher.cancel();
-            await taskWatcher.cancel();
+            try {
+              const result = await this.etcdClient
+                .if(electionKey, 'Create', '==', keyRevision)
+                .then(...update)
+                .commit();
 
-            resolve(undefined);
-          }
-        });
+              if (!result.succeeded) {
+                // We somehow lost leadership, so just stop everything we're doing
+                throw new SplitBrainError();
+              }
+              return;
+            } catch (err) {
+              this.logger.error(err);
+
+              // Cleanup resources and resign
+              await memberWatcher.cancel();
+              await taskWatcher.cancel();
+
+              resolve(undefined);
+              // Stop further updates, just let the next leader do its thing
+              return Promise.reject();
+            }
+          }, 1),
+        )
+        .subscribe();
 
       memberWatcher.on('data', (data) => {
         clientIds = this.processMembershipChanges(data.events, clientIds);
+
+        this.logger.log(`Current clients in cluster: ${clientIds}`);
+
         const newDistribution = this.moduleConfig.distributionStrategy(
           taskIds,
           clientIds,
@@ -162,7 +208,10 @@ export class DistributionService implements OnModuleInit {
       });
 
       taskWatcher.on('data', (data) => {
-        taskIds = this.processMembershipChanges(data.events, taskIds);
+        taskIds = this.processTaskChanges(data.events, taskIds);
+
+        this.logger.log(`Current tasks in cluster: ${taskIds}`);
+
         const newDistribution = this.moduleConfig.distributionStrategy(
           taskIds,
           clientIds,
@@ -201,6 +250,30 @@ export class DistributionService implements OnModuleInit {
     return newCluster;
   }
 
+  private processTaskChanges(
+    events: IEvent[],
+    currentTasks: string[],
+  ): string[] {
+    const newTasks = [...currentTasks];
+
+    for (const event of events) {
+      const member = event.kv.key.toString().replace(this.taskPrefix, '');
+
+      if (event.type === 'Put') {
+        if (!newTasks.includes(member)) {
+          newTasks.push(member);
+        }
+      } else {
+        const idx = newTasks.indexOf(member);
+        if (idx > -1) {
+          newTasks.splice(idx, 1);
+        }
+      }
+    }
+
+    return newTasks;
+  }
+
   /**
    * Build operation to incrementally update task distribution in order to get
    * from `cur` to `target`
@@ -232,7 +305,9 @@ export class DistributionService implements OnModuleInit {
     return ops;
   }
 
-  private async observeTasksAssignedToSelf() {
+  private async observeTasksAssignedToSelf(
+    coordinationClient: CoordinationClient,
+  ) {
     const initialTaskAssignment = await this.getTasksAssignedToClientId(
       this.clientId,
     );
@@ -256,8 +331,9 @@ export class DistributionService implements OnModuleInit {
       const added = difference(newTaskIds, taskIds);
       const removed = difference(taskIds, newTaskIds);
       this.logger.log(`Added tasks: ${added}. Removed tasks: ${removed}`);
-
       taskIds = newTaskIds;
+
+      await coordinationClient.onTaskListUpdate(taskIds);
     });
   }
 

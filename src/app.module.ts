@@ -3,6 +3,8 @@ import { ConfigModule } from '@nestjs/config';
 import { CoordinationConfig, coordinationConfigObj } from './config';
 import { CoordinationModule } from './coordination/coordination.module';
 import { consistentHashing } from './coordination/lib';
+import { AppService } from './app.service';
+import { AppController } from './app.controller';
 
 @Module({
   imports: [
@@ -11,7 +13,6 @@ import { consistentHashing } from './coordination/lib';
       load: [coordinationConfigObj],
     }),
     CoordinationModule.registerAsync({
-      isGlobal: true,
       useFactory: ({ etcdHosts, etcdAuth }: CoordinationConfig) => ({
         etcdHosts: etcdHosts,
         etcdAuth: etcdAuth,
@@ -21,7 +22,7 @@ import { consistentHashing } from './coordination/lib';
       inject: [coordinationConfigObj.KEY],
     }),
   ],
-  controllers: [],
-  providers: [],
+  controllers: [AppController],
+  providers: [AppService],
 })
 export class AppModule {}
