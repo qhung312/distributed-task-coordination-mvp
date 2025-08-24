@@ -114,11 +114,20 @@ export class DistributionService implements OnModuleInit {
         await this.coordinateCluster(electionKey, keyRevision);
       } finally {
         await campaign.resign();
+
+        // If somehow we're still alive, let's try to claim leadership again
+        // We emit 'error' manually because the SDK only doesn't emit it when
+        // we manually resign, only on lease lost due to network condition.
+        //
+        // By design, calling `resign` means that another node (other than current
+        // node) will become leader.
+        // See: https://microsoft.github.io/etcd3/classes/campaign.html#resign
+        campaign.emit('error');
       }
     });
 
     campaign.on('error', (err) => {
-      this.logger.error('Election error', err);
+      this.logger.error(`Lost leadership: ${err}`);
 
       setTimeout(this.runCampaign.bind(this), this.CAMPAIGN_BACKOFF_MS);
     });
@@ -137,11 +146,13 @@ export class DistributionService implements OnModuleInit {
       .toString();
     const memberWatcher = await this.etcdClient
       .watch()
+      .withPreviousKV()
       .startRevision(startWatchRevision)
       .prefix(this.membershipPrefix)
       .create();
     const taskWatcher = await this.etcdClient
       .watch()
+      .withPreviousKV()
       .startRevision(startWatchRevision)
       .prefix(this.taskPrefix)
       .create();
@@ -149,7 +160,7 @@ export class DistributionService implements OnModuleInit {
     // Rebalancing updates can fail, so the next leader can get stuck at a
     // suboptimal distribution if there are no membership changes. We touch the
     // current leader key to make sure we always make progress
-    await this.etcdClient.put(electionKey).touch();
+    await this.etcdClient.put(electionKey).ignoreLease().touch();
 
     return new Promise((resolve) => {
       const writeNewDistribution = new Subject();
@@ -174,7 +185,6 @@ export class DistributionService implements OnModuleInit {
                 // We somehow lost leadership, so just stop everything we're doing
                 throw new SplitBrainError();
               }
-              return;
             } catch (err) {
               this.logger.error(err);
 
@@ -183,8 +193,6 @@ export class DistributionService implements OnModuleInit {
               await taskWatcher.cancel();
 
               resolve(undefined);
-              // Stop further updates, just let the next leader do its thing
-              return Promise.reject();
             }
           }, 1),
         )
@@ -233,13 +241,13 @@ export class DistributionService implements OnModuleInit {
     const newCluster = [...currentCluster];
 
     for (const event of events) {
-      const member = event.kv.value.toString();
-
       if (event.type === 'Put') {
+        const member = event.kv.value.toString();
         if (!newCluster.includes(member)) {
           newCluster.push(member);
         }
       } else {
+        const member = event.prev_kv.value.toString();
         const idx = newCluster.indexOf(member);
         if (idx > -1) {
           newCluster.splice(idx, 1);
@@ -257,13 +265,15 @@ export class DistributionService implements OnModuleInit {
     const newTasks = [...currentTasks];
 
     for (const event of events) {
-      const member = event.kv.key.toString().replace(this.taskPrefix, '');
-
       if (event.type === 'Put') {
+        const member = event.kv.key.toString().replace(this.taskPrefix, '');
         if (!newTasks.includes(member)) {
           newTasks.push(member);
         }
       } else {
+        const member = event.prev_kv.key
+          .toString()
+          .replace(this.taskPrefix, '');
         const idx = newTasks.indexOf(member);
         if (idx > -1) {
           newTasks.splice(idx, 1);
