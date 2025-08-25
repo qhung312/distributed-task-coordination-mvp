@@ -15,7 +15,7 @@ import {
   SplitBrainError,
   TaskDistributionResult,
 } from '../lib';
-import { mergeMap, Subject } from 'rxjs';
+import { bufferTime, map, mergeMap, Subject } from 'rxjs';
 import { DiscoveryService, ModuleRef } from '@nestjs/core';
 
 type ClusterInformation = {
@@ -30,6 +30,12 @@ type TaskAssignment = {
   revision: string;
 };
 
+type IncrementalUpdatePlan = {
+  key: string;
+  type: 'Put' | 'Delete';
+  op: IRequestOp | IOperation;
+}[];
+
 @Injectable()
 export class DistributionService implements OnModuleInit {
   private readonly clientId = hostname();
@@ -41,6 +47,14 @@ export class DistributionService implements OnModuleInit {
   private readonly LEADER_LEASE_SECONDS = 5;
 
   private readonly CAMPAIGN_BACKOFF_MS = 3000;
+
+  private readonly TRIGGER_SYNC_INTERVAL_MS = 5000;
+
+  /**
+   * Incremental updates to the task distribution are buffered and merged
+   * into one big write avoid overwhelming etcd
+   */
+  private readonly DISTRIBUTION_UPDATE_BUFFER_MS = 3000;
 
   private election: Election = this.etcdClient.election(
     this.moduleConfig.taskName,
@@ -156,25 +170,28 @@ export class DistributionService implements OnModuleInit {
       .create();
 
     return new Promise(async (resolve) => {
-      const writeNewDistribution = new Subject();
+      const writeNewDistribution = new Subject<IncrementalUpdatePlan>();
       let shouldStopWriting = false;
 
       // We're performing incremental updates, which means that updates have
       // to be sent and received in order, hence concurrency of 1
       writeNewDistribution
         .pipe(
-          mergeMap(async (update: (IRequestOp | IOperation)[]) => {
+          bufferTime(this.DISTRIBUTION_UPDATE_BUFFER_MS),
+          map(this.batchUpdatePlans.bind(this)),
+          mergeMap(async (plan: IncrementalUpdatePlan) => {
             if (shouldStopWriting) {
               return;
             }
-            if (update.length === 0) {
+            if (plan.length === 0) {
               return;
             }
 
             try {
+              const updates = plan.map((p) => p.op);
               const result = await this.etcdClient
                 .if(electionKey, 'Create', '==', keyRevision)
-                .then(...update)
+                .then(...updates)
                 .commit();
 
               if (!result.succeeded) {
@@ -187,6 +204,7 @@ export class DistributionService implements OnModuleInit {
               // Cleanup resources and resign
               await memberWatcher.cancel();
               await taskWatcher.cancel();
+              clearInterval(triggerStateSync);
 
               writeNewDistribution.complete();
               shouldStopWriting = true;
@@ -230,7 +248,15 @@ export class DistributionService implements OnModuleInit {
       // Rebalancing updates can fail, so the next leader can get stuck at a
       // suboptimal distribution if there are no membership changes. We periodically
       // touch the current leader key to make sure we always make progress
-      await this.etcdClient.put(electionKey).ignoreLease().touch();
+      const triggerStateSync = setInterval(() => {
+        this.etcdClient
+          .put(electionKey)
+          .ignoreLease()
+          .touch()
+          .catch((err) => {
+            this.logger.error(`Failed to touch leader key: ${err}`);
+          });
+      }, this.TRIGGER_SYNC_INTERVAL_MS);
     });
   }
 
@@ -284,6 +310,24 @@ export class DistributionService implements OnModuleInit {
     return newTasks;
   }
 
+  private batchUpdatePlans(
+    plans: IncrementalUpdatePlan[],
+  ): IncrementalUpdatePlan {
+    const ops = plans.flat();
+    const result: IncrementalUpdatePlan = [];
+
+    for (const update of ops) {
+      const existingKeyIdx = result.findIndex((op) => op.key === update.key);
+      if (existingKeyIdx > -1) {
+        // Existing update will be overriden by current one, so just delete it
+        result.splice(existingKeyIdx, 1);
+      }
+      result.push(update);
+    }
+
+    return result;
+  }
+
   /**
    * Build operation to incrementally update task distribution in order to get
    * from `cur` to `target`
@@ -291,15 +335,18 @@ export class DistributionService implements OnModuleInit {
   private buildIncrementalDistributionUpdatePlan(
     cur: TaskDistributionResult,
     target: TaskDistributionResult,
-  ): (IRequestOp | IOperation)[] {
-    const ops: (IRequestOp | IOperation)[] = [];
+  ): IncrementalUpdatePlan {
+    const ops: IncrementalUpdatePlan = [];
 
     // deleted keys
     for (const clientId of Object.keys(cur)) {
       if (!target[clientId]) {
-        ops.push(
-          this.etcdClient.delete().key(`${this.assignmentPrefix}${clientId}`),
-        );
+        const key = `${this.assignmentPrefix}${clientId}`;
+        ops.push({
+          key,
+          type: 'Delete',
+          op: this.etcdClient.delete().key(key),
+        });
       }
     }
 
@@ -308,11 +355,12 @@ export class DistributionService implements OnModuleInit {
       const sameTasks = isEqual(sortBy(taskIds), sortBy(cur[clientId]));
 
       if (!sameTasks) {
-        ops.push(
-          this.etcdClient
-            .put(`${this.assignmentPrefix}${clientId}`)
-            .value(JSON.stringify(taskIds)),
-        );
+        const key = `${this.assignmentPrefix}${clientId}`;
+        ops.push({
+          key,
+          type: 'Put',
+          op: this.etcdClient.put(key).value(JSON.stringify(taskIds)),
+        });
       }
     }
 
