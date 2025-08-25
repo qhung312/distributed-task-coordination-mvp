@@ -8,7 +8,7 @@ import {
 } from '../coordination.module-definition';
 import { TaskService } from './task.service';
 import { BigNumber } from 'bignumber.js';
-import { difference } from 'lodash';
+import { isEqual, sortBy } from 'lodash';
 import {
   CoordinationClient,
   CoordinationTaskName,
@@ -40,12 +40,12 @@ export class DistributionService implements OnModuleInit {
 
   private readonly LEADER_LEASE_SECONDS = 5;
 
+  private readonly CAMPAIGN_BACKOFF_MS = 3000;
+
   private election: Election = this.etcdClient.election(
     this.moduleConfig.taskName,
     this.LEADER_LEASE_SECONDS,
   );
-
-  private readonly CAMPAIGN_BACKOFF_MS = 3000;
 
   /**
    * Prefix that the SDK uses to perform leader election. We piggyback on this
@@ -155,19 +155,18 @@ export class DistributionService implements OnModuleInit {
       .prefix(this.taskPrefix)
       .create();
 
-    // Rebalancing updates can fail, so the next leader can get stuck at a
-    // suboptimal distribution if there are no membership changes. We touch the
-    // current leader key to make sure we always make progress
-    await this.etcdClient.put(electionKey).ignoreLease().touch();
-
-    return new Promise((resolve) => {
+    return new Promise(async (resolve) => {
       const writeNewDistribution = new Subject();
+      let shouldStopWriting = false;
 
       // We're performing incremental updates, which means that updates have
       // to be sent and received in order, hence concurrency of 1
       writeNewDistribution
         .pipe(
           mergeMap(async (update: (IRequestOp | IOperation)[]) => {
+            if (shouldStopWriting) {
+              return;
+            }
             if (update.length === 0) {
               return;
             }
@@ -189,6 +188,9 @@ export class DistributionService implements OnModuleInit {
               await memberWatcher.cancel();
               await taskWatcher.cancel();
 
+              writeNewDistribution.complete();
+              shouldStopWriting = true;
+
               resolve(undefined);
             }
           }, 1),
@@ -197,8 +199,6 @@ export class DistributionService implements OnModuleInit {
 
       memberWatcher.on('data', (data) => {
         clientIds = this.processMembershipChanges(data.events, clientIds);
-
-        this.logger.log(`Current clients in cluster: ${clientIds}`);
 
         const newDistribution = this.moduleConfig.distributionStrategy(
           taskIds,
@@ -215,8 +215,6 @@ export class DistributionService implements OnModuleInit {
       taskWatcher.on('data', (data) => {
         taskIds = this.processTaskChanges(data.events, taskIds);
 
-        this.logger.log(`Current tasks in cluster: ${taskIds}`);
-
         const newDistribution = this.moduleConfig.distributionStrategy(
           taskIds,
           clientIds,
@@ -228,6 +226,11 @@ export class DistributionService implements OnModuleInit {
         clientAssignments = newDistribution;
         writeNewDistribution.next(updatePlan);
       });
+
+      // Rebalancing updates can fail, so the next leader can get stuck at a
+      // suboptimal distribution if there are no membership changes. We periodically
+      // touch the current leader key to make sure we always make progress
+      await this.etcdClient.put(electionKey).ignoreLease().touch();
     });
   }
 
@@ -302,11 +305,15 @@ export class DistributionService implements OnModuleInit {
 
     // upserted keys
     for (const [clientId, taskIds] of Object.entries(target)) {
-      ops.push(
-        this.etcdClient
-          .put(`${this.assignmentPrefix}${clientId}`)
-          .value(JSON.stringify(taskIds)),
-      );
+      const sameTasks = isEqual(sortBy(taskIds), sortBy(cur[clientId]));
+
+      if (!sameTasks) {
+        ops.push(
+          this.etcdClient
+            .put(`${this.assignmentPrefix}${clientId}`)
+            .value(JSON.stringify(taskIds)),
+        );
+      }
     }
 
     return ops;
@@ -335,9 +342,6 @@ export class DistributionService implements OnModuleInit {
           event.type === 'Put' ? JSON.parse(event.kv.value.toString()) : [];
       }
 
-      const added = difference(newTaskIds, taskIds);
-      const removed = difference(taskIds, newTaskIds);
-      this.logger.log(`Added tasks: ${added}. Removed tasks: ${removed}`);
       taskIds = newTaskIds;
 
       await coordinationClient.onTaskListUpdate(taskIds);

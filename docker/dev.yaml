@@ -3,7 +3,6 @@ version: '3.8'
 services:
   etcd0:
     image: 'docker.io/bitnami/etcd:3.5'
-    container_name: dev-etcd0
     hostname: etcd0
     ports:
       - '2379:2379'
