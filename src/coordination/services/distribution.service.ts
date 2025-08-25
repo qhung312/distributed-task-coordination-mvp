@@ -15,7 +15,7 @@ import {
   SplitBrainError,
   TaskDistributionResult,
 } from '../lib';
-import { debounceTime, mergeMap, Subject } from 'rxjs';
+import { mergeMap, Subject } from 'rxjs';
 import { DiscoveryService, ModuleRef } from '@nestjs/core';
 
 type ClusterInformation = {
@@ -46,8 +46,6 @@ export class DistributionService implements OnModuleInit {
   );
 
   private readonly CAMPAIGN_BACKOFF_MS = 3000;
-
-  private readonly REDISTRIBUTION_DEBOUNCE_MS = 3000;
 
   /**
    * Prefix that the SDK uses to perform leader election. We piggyback on this
@@ -169,7 +167,6 @@ export class DistributionService implements OnModuleInit {
       // to be sent and received in order, hence concurrency of 1
       writeNewDistribution
         .pipe(
-          debounceTime(this.REDISTRIBUTION_DEBOUNCE_MS),
           mergeMap(async (update: (IRequestOp | IOperation)[]) => {
             if (update.length === 0) {
               return;

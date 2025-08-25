@@ -1,0 +1,20 @@
+# Ignore development-related files and directories
+
+node_modules/
+.env
+.git/
+.gitignore
+logs/
+tmp/
+coverage/
+
+# Ignore build artifacts
+
+dist/
+build/
+
+# Ignore sensitive files (if not handled by .env)
+
+_.log
+_.swp
+\*.bak
