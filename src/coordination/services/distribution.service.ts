@@ -42,6 +42,8 @@ export class DistributionService implements OnModuleInit {
 
   private readonly CAMPAIGN_BACKOFF_MS = 3000;
 
+  private readonly TRIGGER_SYNC_INTERVAL_MS = 20000;
+
   private election: Election = this.etcdClient.election(
     this.moduleConfig.taskName,
     this.LEADER_LEASE_SECONDS,
@@ -187,6 +189,7 @@ export class DistributionService implements OnModuleInit {
               // Cleanup resources and resign
               await memberWatcher.cancel();
               await taskWatcher.cancel();
+              clearInterval(triggerStateSync);
 
               writeNewDistribution.complete();
               shouldStopWriting = true;
@@ -230,7 +233,15 @@ export class DistributionService implements OnModuleInit {
       // Rebalancing updates can fail, so the next leader can get stuck at a
       // suboptimal distribution if there are no membership changes. We periodically
       // touch the current leader key to make sure we always make progress
-      await this.etcdClient.put(electionKey).ignoreLease().touch();
+      const triggerStateSync = setInterval(() => {
+        this.etcdClient
+          .put(electionKey)
+          .ignoreLease()
+          .touch()
+          .catch((err) => {
+            this.logger.error(`Failed to touch leader key: ${err}`);
+          });
+      }, this.TRIGGER_SYNC_INTERVAL_MS);
     });
   }
 
